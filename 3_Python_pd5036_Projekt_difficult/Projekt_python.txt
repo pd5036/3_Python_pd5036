@@ -1,0 +1,185 @@
+# ten fragment kodu to sekcja importów, w której przygotowuję narzędzia do pracy (biblioteki). 
+import os
+import subprocess
+from Bio import AlignIO
+from Bio import Phylo
+from Bio.Seq import Seq
+from Bio.Align import MultipleSeqAlignment
+from Bio import Entrez
+from Bio import SeqIO  
+from Bio.Phylo.TreeConstruction import DistanceCalculator, DistanceTreeConstructor
+from collections import Counter
+from Bio.Align import AlignInfo
+from Bio.SeqRecord import SeqRecord
+import Bio.Blast.NCBIWWW as NCBIWWW
+import Bio.Blast.NCBIXML as NCBIXML 
+import matplotlib.pyplot as plt
+
+#zapisywanie email i api key do pliku
+def get_user_credentials(): # funkcja automatycznego łączenia z baza NCBI
+    if os.path.exists("user_data.txt"): #sprawdzenie czy istnieje plik user_data.txt z danymi do logowania
+        with open("user_data.txt", "r") as f: # jeśli tak to go otwiera i czyta dane: adres email i api_key.
+            lines = f.readlines()
+            email = lines[0].strip()
+            api_key = lines[1].strip()
+    else: # jeśli nie ma pliku prosi o dane i zapisuje do pliku
+        email = input("Podaj swój email dla NCBI: ")
+        api_key = input("Podaj swój NCBI API KEY: ")
+        with open("user_data.txt", "w") as f:
+            f.write(f"{email}\n{api_key}")
+    return email, api_key
+
+Entrez.email, Entrez.api_key = get_user_credentials() # dane są przekazywane do NCBI
+
+# Pobieranie rekordów na podstawie taxid
+taxid = input("Enter taxid id: ").strip()  # prośba o wpisanie nr taksony NCBI, wpisujemy 36050
+query = f"txid{taxid}[Organism:exp]" #przeszukanie bazy
+print("Szukanie rekordów w NCBI...")
+handle = Entrez.esearch(db="nucleotide", term=query, retmax=50) #przeszukanie bazy nukleotydów, w ilość maksymalnie 50 rekordów.
+record = Entrez.read(handle)
+handle.close()  
+idlist = record["IdList"] # przygotowanie listy rekordów poasujących do zapytania.
+
+# Jeśli brak rekordów, zakończ program
+if not idlist:
+    print("Brak rekordów dla podanego taxid.")
+    exit()  
+
+
+# Liczenie wystąpień genów
+gene_counts = {} #przygotowanie macierzy,
+fetch_handle = Entrez.efetch(db="nucleotide", id=idlist, rettype="gb", retmode="text") #program tworzy informację dotyczące tych 50 plików/rekordów wraz z szczegółowymi danymi - opisem z bazy genbank
+records = list(SeqIO.parse(fetch_handle, "genbank"))    
+
+# Przegląd przez rekordy i cechy genów za pomocą pętli
+for seq_record in records: #analizuj pierwszy plik 
+    for feature in seq_record.features: #analizuj cechy genów w pliku
+        if feature.type == "gene":
+            gene_name = feature.qualifiers.get("gene", [""])[0] #program sprawdza nazwę genu
+            gene_counts[gene_name] = gene_counts.get(gene_name, 0) + 1 #program liczy wystąpienia genów.
+fetch_handle.close()
+
+# Wyświetlanie liczby wystąpień genów
+print("Liczba wystąpień genów:") # piesze tekst
+for gene, count in gene_counts.items():
+    print(f"{gene}: {count}")   #pisze na ekranie jaki gen znalazł oraz jego liczbe.
+selected_gene = input("Wybierz gen do analizy: ").strip() #pyta który gen należy zanalizować, wpisujemy TEF1a jak ten którego powtórzeń jest najwięcej.
+fasta_records = [] #przygotowanie nowej macierzy
+fetch_handle = Entrez.efetch(db="nucleotide", id=idlist, rettype="gb", retmode="text") #program jeszcze raz łączy się z bazą danych NCBI, prosi o pełne pliki, rekoerdy. 
+records = list(SeqIO.parse(fetch_handle, "genbank")) #pobieranie plików. 
+print(f"Rekordy zawierające gen {selected_gene}:") 
+
+# Wyświetlanie rekordów zawierających wybrany gen
+
+for seq_record in records:
+    for feature in seq_record.features:
+        if feature.type == "gene" and feature.qualifiers.get("gene", [""])[0] == selected_gene:
+            print(f"ID: {seq_record.id}, Opis: {seq_record.description}")#wypisuje jekie pliki zawierające wybrany gen zostały pobrane.
+            break       
+fetch_handle.close()
+
+# Zapis sekwencji wybranego genu do pliku FASTA
+fasta_records = [] #tworzenie macierzy
+for seq_record in records: #przeglada wybany plik po pliku
+    for feature in seq_record.features: # analizuje szczegółowe informacje
+        if feature.type == "gene" and feature.qualifiers.get("gene", [""])[0] == selected_gene:# program działa jak filtr,sprawdza: Czy to jest gen TEF1a.
+            fasta_record = SeqRecord(feature.location.extract(seq_record.seq), id=seq_record.id, description=seq_record.description) #narzędzie wycina tylko ten gen z sekwencji
+            fasta_records.append(fasta_record) #zapisuje wszystkie wycięte geny do nowej macierzy fasta_record.
+            break
+SeqIO.write(fasta_records, f"{selected_gene}_sequences.fasta", "fasta") #ta komenda zapisuje wszytkie sekwencje wybrango genu do pliku .fasta.
+
+print("\nZapisano sekwencje do pliku FASTA.")
+print(f"Liczba zapisanych sekwencji: {len(fasta_records)}") #program wyspisuje ile sekwecnji znalzai zapsisal.
+
+# sprawdzanie długości sekwencji
+lengths = [len(record.seq) for record in fasta_records] #zbieranie długości genów (liczba nukleotudów.
+if lengths:
+    print(f"Długość najkrótszej sekwencji: {min(lengths)}")
+    print(f"Długość najdłuższej sekwencji: {max(lengths)}")
+    avg_length = sum(lengths) / len(lengths)
+    print(f"Średnia długość sekwencji: {avg_length:.2f}")
+#wpisuje dane dotyczące najkrótszej i najdłuższej sekwencji oraz średnia długość sekwencji. 
+
+
+
+# Tworzenie wielokrotnego wyrównania sekwencji
+print("\nTworzenie wielokrotnego wyrównania sekwencji...") 
+alignment = MultipleSeqAlignment(fasta_records) # Program układa wszystkie sekwencje, dopasowuje. 
+consensus_sequence = "" #budowanie macierzy na uzgodnioną jedną sekwencję
+for i in range(alignment.get_alignment_length()): #program sprawdza pionowo do góry do dołu poszczególne nukleotydy
+    column = alignment[:, i] 
+    most_common = max(set(column), key=column.count) #szuka nukleotudy który występuje najczesciej
+    consensus_sequence += most_common   #zapisuje w sekwencji końcowej najczęściej występującą literkę.
+print("\nSekwencja konsensusowa:")
+print(consensus_sequence)
+
+# Zapis sekwencji konsensusowej do pliku FASTA
+with open(f"{selected_gene}_consensus.fasta", "w") as f:
+    f.write(f">Consensus sequence for {selected_gene}\n")
+    f.write(consensus_sequence)
+print(f"\nZapisano sekwencję konsensusową do pliku {selected_gene}_consensus.fasta")
+
+# Wykonanie  BLASTa
+print("\nWykonywanie BLASTa...")  
+result_handle = NCBIWWW.qblast("blastn", "nt", consensus_sequence) # wysłanie sekwencji końcowej do porówania do bazy NCBI
+blast_records = NCBIXML.read(result_handle) 
+print("\nWyniki BLASTa:")
+with open("wyniki_blast.txt", "w", encoding="utf-8") as txt_file: # otwieranie wyników analiz
+    txt_file.write("WYNIKI ANALIZY BLAST\n")
+    txt_file.write("=" * 30 + "\n")
+    for alignment in blast_records.alignments:
+        print(f"  Trafienie: {alignment.title}")
+        for hsp in alignment.hsps:
+            if hsp.expect < 0.01:
+                print(f"Identyfikator sekwencji: {alignment.hit_id}") #pokazuje identyfiacktor sekwejcji
+                print(f"opis sekwencji: {alignment.hit_def}") #pokazuje opis sekwencji 
+                print(f"Poziom dopasowania: {hsp.score}") # Pokazuje poziom dopasowania 
+                print(f"Istotność statystyczna: {hsp.expect}\n") # Pewność dopasowania 
+                output = (
+                    f"Trafienie: {alignment.title}\n"
+                    f"Identyfikator sekwencji: {alignment.hit_id}\n"
+                    f"Opis sekwencji: {alignment.hit_def}\n"
+                    f"Poziom dopasowania (Score): {hsp.score}\n"
+                    f"Istotność statystyczna (E-value): {hsp.expect}\n"
+                    f"{'-' * 20}\n"
+                )
+            txt_file.write(output)
+            print(f" Zapisano: {alignment.title[:50]}...") # wszytkie te informacje zapisywane sa do pliku
+result_handle.close()
+print("Analiza zakończona.")
+
+
+
+# Drzweo filogenetyczne
+print("\nTworzenie wielokrotnego wyrównania sekwencji...")
+alignment = MultipleSeqAlignment(fasta_records) #układanie poszeczegolnych sekwencji do porównania
+print("Tworzenie drzewa filogenetycznego...")
+
+try:
+    calculator = DistanceCalculator('identity') #sprawdzanie jak bardzo sekwencje rózneia się od siebie
+    dm = calculator.get_distance(alignment)
+    constructor = DistanceTreeConstructor(calculator, 'nj') #budowanie drzewa filogentyczngo prównanie wspólnych cech. 
+    tree = constructor.build_tree(alignment)
+    fig = plt.figure(figsize=(14, 12), dpi=100) # otwiera prgram graficzny
+    ax = fig.add_subplot(1, 1, 1)
+    def get_label(clade): #podpisuje gałęzie 
+        if clade.is_terminal(): # Jeśli to koniec gałęzi (takson)
+            return str(clade.name)
+        return "" # Jeśli to węzeł wewnętrzny, zwróć pusty tekst
+    Phylo.draw(tree, axes=ax, label_func=get_label, do_show=False)
+    plt.ylabel("Taksony", fontsize=12)
+    plt.xlabel("Dystans genetyczny", fontsize=12)
+    plt.title(f"Drzewo filogenetyczne dla genu {selected_gene}", fontsize=15, pad=20)
+    plt.tight_layout()
+    plt.show() # wyswitla obraz
+except Exception as e:
+    print(f"Błąd podczas tworzenia drzewa filogenetycznego: {e}")
+       
+
+
+
+
+
+
+
+
